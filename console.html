@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PTaaS Operations Console — V2V Technology Consulting</title>
+
+<!-- React (no build step — runs directly in the browser) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- In-browser JSX transform, so this file can stay plain .html on GitHub Pages -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- Tailwind (JIT, in-browser) -->
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+
+// ---- CONFIG ---------------------------------------------------------
+// Point this at your deployed Cloudflare Worker (see worker/index.js).
+// This is the ONLY thing that changed from a security standpoint: the
+// client calls YOUR endpoint, never Anthropic directly, so no API key
+// ever reaches the browser and no Claude.ai account is required.
+const WORKER_URL = "https://ptaas-agent-proxy.kirkngrant.workers.dev";
+// ----------------------------------------------------------------------
+
+const STORAGE_KEY = "ptaas-engagement-v1";
+
+// ---- Minimal inline icon set (replaces lucide-react, no package needed) ----
+function Icon({ children, size = 16, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+         strokeLinejoin="round" className={className}>
+      {children}
+    </svg>
+  );
+}
+const Bot = (p) => <Icon {...p}><path d="M12 8V4H8" /><rect x="4" y="8" width="16" height="12" rx="2" /><path d="M2 14h2" /><path d="M20 14h2" /><path d="M15 13v2" /><path d="M9 13v2" /></Icon>;
+const UserCheck = (p) => <Icon {...p}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><polyline points="17 11 19 13 23 9" /></Icon>;
+const UserIcon = (p) => <Icon {...p}><circle cx="12" cy="8" r="4" /><path d="M4 20c0-4 4-6 8-6s8 2 8 6" /></Icon>;
+const Lock = (p) => <Icon {...p}><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></Icon>;
+const CheckCircle2 = (p) => <Icon {...p}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></Icon>;
+const Loader2 = (p) => <Icon {...p}><path d="M21 12a9 9 0 1 1-6.219-8.56" /></Icon>;
+const RotateCcw = (p) => <Icon {...p}><path d="M1 4v6h6" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></Icon>;
+
+// ---- localStorage shim matching the window.storage.get/set signature ----
+// (window.storage only exists inside Claude.ai's artifact sandbox — this
+// replaces it with the real browser storage API so the app works standalone.)
+const storage = {
+  async get(key) {
+    const value = window.localStorage.getItem(key);
+    return value !== null ? { key, value, shared: false } : null;
+  },
+  async set(key, value) {
+    window.localStorage.setItem(key, value);
+    return { key, value, shared: false };
+  },
+};
+
+const initialEngagement = () => ({
+  intake: { company: "", industry: "", investment: "", duration: "", scope: "", concern: "", contact: "", submitted: false, approved: false },
+  diagnose: { q: "", interviews: "", artifacts: "", metrics: "", agent1: "", agent2: "", loading1: false, loading2: false, error1: "", error2: "", reportDraft: "", approved: false, clientAck: false },
+  stabilize: { decisions: "", kpis: "", vendors: "", raid: "", agentOut: "", loading: false, error: "", decisionsDraft: "", approved: false, clientAck: false },
+  recover: { exec: "", readiness: "", agentOut: "", loading: false, error: "", playbookDraft: "", approved: false, clientAck: false },
+});
+
+// The only functional change here: this now calls YOUR Worker, not Anthropic
+// directly. The Worker holds the real API key server-side.
+async function callClaude(system, userText) {
+  const response = await fetch(WORKER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, userText }),
+  });
+  if (!response.ok) {
+    let detail = "";
+    try { detail = (await response.json()).error || ""; } catch {}
+    throw new Error(`Agent call failed (${response.status})${detail ? ": " + detail : ""}`);
+  }
+  const data = await response.json();
+  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
+  if (!text) throw new Error("Agent returned no text.");
+  return text;
+}
+
+function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "-"); }
+
+function OwnerBadge({ owner }) {
+  const map = {
+    ai: { label: "AI agent", icon: Bot, cls: "bg-teal-800 text-teal-50" },
+    lead: { label: "You — recovery lead", icon: UserCheck, cls: "bg-amber-800 text-amber-50" },
+    client: { label: "Client", icon: UserIcon, cls: "bg-neutral-600 text-neutral-50" },
+  };
+  const m = map[owner];
+  const IconComp = m.icon;
+  return (
+    <span className={"inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded shrink-0 " + m.cls}>
+      <IconComp size={13} /> {m.label}
+    </span>
+  );
+}
+
+function StatusPill({ status }) {
+  if (status === "done") return <span className="inline-flex items-center gap-1 text-xs font-medium text-teal-800"><CheckCircle2 size={14} /> Done</span>;
+  if (status === "active") return <span className="text-xs font-medium text-amber-800">In progress</span>;
+  return <span className="text-xs font-medium text-neutral-400">Pending</span>;
+}
+
+function StepCard({ owner, title, status, children }) {
+  return (
+    <div className="border border-neutral-200 rounded bg-white p-5 mb-4">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="font-semibold text-neutral-900 text-[15px]">{title}</h3>
+        <div className="flex items-center gap-3">
+          <OwnerBadge owner={owner} />
+          <StatusPill status={status} />
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function TextField({ label, value, onChange, rows = 3, placeholder }) {
+  const id = "f-" + slug(label);
+  return (
+    <div className="mb-3">
+      <label htmlFor={id} className="block text-xs font-medium text-neutral-500 mb-1">{label}</label>
+      <textarea
+        id={id}
+        className="w-full border border-neutral-300 rounded p-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-700/40"
+        rows={rows}
+        value={value}
+        placeholder={placeholder}
+        onChange={onChange}
+      />
+    </div>
+  );
+}
+
+function PhaseHeader({ eyebrow, title, desc }) {
+  return (
+    <div className="mb-6">
+      <div className="text-xs font-mono tracking-widest text-amber-800 uppercase mb-1">{eyebrow}</div>
+      <h2 className="text-2xl font-semibold mb-1">{title}</h2>
+      <p className="text-sm text-neutral-500 max-w-xl">{desc}</p>
+    </div>
+  );
+}
+
+function OwnerLegend() {
+  return (
+    <div className="flex flex-wrap items-center gap-3 mb-6 text-xs text-neutral-500">
+      <span>Who acts at each step:</span>
+      <OwnerBadge owner="ai" /><span className="text-neutral-400">runs automatically</span>
+      <OwnerBadge owner="lead" /><span className="text-neutral-400">reviews and decides</span>
+      <OwnerBadge owner="client" /><span className="text-neutral-400">provides input or confirms</span>
+    </div>
+  );
+}
+
+function IntakeView({ engagement, patch, setView }) {
+  const d = engagement.intake;
+  const canSubmit = d.company && d.concern;
+  return (
+    <div>
+      <PhaseHeader eyebrow="Step 0 · Before day 1" title="Program recovery request" desc="A prospective client's program details, captured before the 90-day clock starts." />
+      <StepCard owner="client" title="Submit request" status={d.submitted ? "done" : "active"}>
+        <div className="grid sm:grid-cols-2 gap-x-4">
+          <TextField label="Company name" rows={1} value={d.company} onChange={(e) => patch("intake", { company: e.target.value })} />
+          <TextField label="Industry" rows={1} value={d.industry} onChange={(e) => patch("intake", { industry: e.target.value })} />
+          <TextField label="Program investment" rows={1} value={d.investment} onChange={(e) => patch("intake", { investment: e.target.value })} placeholder="e.g. $14,000,000" />
+          <TextField label="Duration" rows={1} value={d.duration} onChange={(e) => patch("intake", { duration: e.target.value })} placeholder="e.g. 18 months" />
+        </div>
+        <TextField label="Program scope" rows={2} value={d.scope} onChange={(e) => patch("intake", { scope: e.target.value })} placeholder="What is this program, and who is it for?" />
+        <TextField label="Chief concern" rows={2} value={d.concern} onChange={(e) => patch("intake", { concern: e.target.value })} placeholder="What's driving the request right now?" />
+        <TextField label="Contact name" rows={1} value={d.contact} onChange={(e) => patch("intake", { contact: e.target.value })} />
+        {!d.submitted && (
+          <button disabled={!canSubmit} onClick={() => patch("intake", { submitted: true })} className="mt-1 text-sm font-medium bg-neutral-900 text-white px-4 py-2 rounded disabled:opacity-40">
+            Submit request
+          </button>
+        )}
+      </StepCard>
+
+      {d.submitted && (
+        <StepCard owner="lead" title="Review & approve engagement" status={d.approved ? "done" : "active"}>
+          <p className="text-sm text-neutral-600 mb-3">In a live engagement this is the 30-minute Program Health Diagnostic call. Here, review what was submitted and decide whether to open the engagement.</p>
+          {!d.approved ? (
+            <button onClick={() => { patch("intake", { approved: true }); setView("diagnose"); }} className="text-sm font-medium bg-amber-800 text-white px-4 py-2 rounded">
+              Approve — start Diagnose phase
+            </button>
+          ) : (
+            <p className="text-sm text-teal-800">Approved. Diagnose phase is open.</p>
+          )}
+        </StepCard>
+      )}
+    </div>
+  );
+}
+
+function DiagnoseView({ engagement, patch, setView }) {
+  const d = engagement.diagnose;
+  const evidenceReady = !!(d.q || d.interviews || d.artifacts || d.metrics);
+
+  async function runAgent1() {
+    patch("diagnose", { loading1: true, error1: "" });
+    try {
+      const system = "You are the Artifact and Financial Reader agent inside a program-turnaround recovery platform. Given raw client evidence (discovery questionnaire answers, interview notes, status reports and budgets, RAID log, metrics), produce, using short headers and bullets: (1) Structured baseline - client profile, investment, duration, reported status vs what the evidence actually shows. (2) Financial and schedule risk flags, checked against general red-flag heuristics such as milestone slippage above 20% or budget variance above 10% without an approved change. (3) Any internal inconsistencies in the evidence itself. (4) A one-line evidence-confidence note. Do not invent facts not present in the evidence; if evidence is thin on a dimension, say so plainly instead of filling the gap. Keep the entire response under 550 words.";
+      const userText = `CLIENT EVIDENCE\n\nDiscovery questionnaire:\n${d.q || "(not provided)"}\n\nStakeholder interview notes:\n${d.interviews || "(not provided)"}\n\nStatus reports / artifacts / budgets:\n${d.artifacts || "(not provided)"}\n\nMetrics / RAID data:\n${d.metrics || "(not provided)"}`;
+      const out = await callClaude(system, userText);
+      patch("diagnose", { agent1: out, loading1: false });
+    } catch (e) {
+      patch("diagnose", { loading1: false, error1: e.message || "Something went wrong." });
+    }
+  }
+
+  async function runAgent2() {
+    patch("diagnose", { loading2: true, error2: "" });
+    try {
+      const system = "You are the Root-Cause agent inside a program-turnaround recovery platform, continuing from the Artifact and Financial Reader's output. Apply narrative-conflict testing: if leadership language in the evidence sounds calmer than delivery-role language, name that gap as a reporting-visibility signal in its own right. Produce a draft Program Health Report with these sections: Executive Summary (2-3 sentences, an overall status of Green, Yellow, or Red), 3 to 5 Top Findings each written as Observation, then Evidence, then Finding, then Business Impact, then Recommendation, and a short First 30 Days action list. Ground every finding only in the evidence given; if evidence is sparse, produce fewer and more honest findings rather than padding. Keep the entire response under 650 words with clear short headers.";
+      const userText = `ORIGINAL CLIENT EVIDENCE\n\nDiscovery questionnaire:\n${d.q || "(not provided)"}\n\nInterviews:\n${d.interviews || "(not provided)"}\n\nArtifacts:\n${d.artifacts || "(not provided)"}\n\nMetrics:\n${d.metrics || "(not provided)"}\n\nARTIFACT AND FINANCIAL READER OUTPUT\n\n${d.agent1}`;
+      const out = await callClaude(system, userText);
+      patch("diagnose", { agent2: out, reportDraft: out, loading2: false });
+    } catch (e) {
+      patch("diagnose", { loading2: false, error2: e.message || "Something went wrong." });
+    }
+  }
+
+  return (
+    <div>
+      <PhaseHeader eyebrow="Phase 1 · Days 1–10" title="Diagnose" desc="Establish a true baseline and root causes before anything else moves." />
+
+      <StepCard owner="client" title="Submit evidence" status={evidenceReady ? "done" : "active"}>
+        <TextField label="Discovery questionnaire answers" value={d.q} onChange={(e) => patch("diagnose", { q: e.target.value })} placeholder="Client profile, investment, duration, top concern..." />
+        <TextField label="Stakeholder interview notes or quotes" value={d.interviews} onChange={(e) => patch("diagnose", { interviews: e.target.value })} placeholder="Notes or quotes from sponsor, PM, IT, business, change leads..." />
+        <TextField label="Status reports, budgets, governance artifacts" value={d.artifacts} onChange={(e) => patch("diagnose", { artifacts: e.target.value })} />
+        <TextField label="Metrics, trend data, RAID log" value={d.metrics} onChange={(e) => patch("diagnose", { metrics: e.target.value })} />
+      </StepCard>
+
+      <StepCard owner="ai" title="Run: Artifact & Financial Reader" status={d.agent1 ? "done" : evidenceReady ? "active" : "pending"}>
+        <p className="text-sm text-neutral-600 mb-3">Ingests the evidence above and produces a structured baseline plus benchmark-checked risk flags.</p>
+        {!d.agent1 && (
+          <button disabled={!evidenceReady || d.loading1} onClick={runAgent1} className="text-sm font-medium bg-teal-800 text-white px-4 py-2 rounded disabled:opacity-40 inline-flex items-center gap-2">
+            {d.loading1 && <Loader2 size={14} className="animate-spin" />} Run agent
+          </button>
+        )}
+        {d.error1 && <p className="text-sm text-red-700 mt-2">{d.error1} <button onClick={runAgent1} className="underline">Retry</button></p>}
+        {d.agent1 && <pre className="whitespace-pre-wrap text-sm bg-neutral-50 border border-neutral-200 rounded p-3 mt-2 font-sans">{d.agent1}</pre>}
+      </StepCard>
+
+      {d.agent1 && (
+        <StepCard owner="ai" title="Run: Root-Cause agent — draft Program Health Report" status={d.agent2 ? "done" : "active"}>
+          <p className="text-sm text-neutral-600 mb-3">Tests stakeholder narratives against the evidence and drafts the findings and the Program Health Report.</p>
+          {!d.agent2 && (
+            <button disabled={d.loading2} onClick={runAgent2} className="text-sm font-medium bg-teal-800 text-white px-4 py-2 rounded disabled:opacity-40 inline-flex items-center gap-2">
+              {d.loading2 && <Loader2 size={14} className="animate-spin" />} Run agent
+            </button>
+          )}
+          {d.error2 && <p className="text-sm text-red-700 mt-2">{d.error2} <button onClick={runAgent2} className="underline">Retry</button></p>}
+        </StepCard>
+      )}
+
+      {d.agent2 && (
+        <StepCard owner="lead" title="Review & approve the Program Health Report" status={d.approved ? "done" : "active"}>
+          <p className="text-sm text-neutral-600 mb-3">Edit the draft before it becomes final — nothing reaches the client unreviewed.</p>
+          <textarea className="w-full border border-neutral-300 rounded p-3 text-sm font-sans" rows={14} value={d.reportDraft} onChange={(e) => patch("diagnose", { reportDraft: e.target.value })} />
+          {!d.approved && (
+            <button onClick={() => patch("diagnose", { approved: true })} className="mt-3 text-sm font-medium bg-amber-800 text-white px-4 py-2 rounded">
+              Approve as final
+            </button>
+          )}
+        </StepCard>
+      )}
+
+      {d.approved && (
+        <StepCard owner="client" title="Acknowledge Program Health Report" status={d.clientAck ? "done" : "active"}>
+          {!d.clientAck ? (
+            <button onClick={() => { patch("diagnose", { clientAck: true }); setView("stabilize"); }} className="text-sm font-medium bg-neutral-900 text-white px-4 py-2 rounded">
+              Acknowledge & unlock Stabilize phase
+            </button>
+          ) : (
+            <p className="text-sm text-teal-800">Acknowledged. Stabilize phase is open.</p>
+          )}
+        </StepCard>
+      )}
+    </div>
+  );
+}
+
+function StabilizeView({ engagement, patch, setView }) {
+  const d = engagement.stabilize;
+  const inputReady = !!(d.decisions || d.kpis || d.vendors || d.raid);
+
+  async function runAgent() {
+    patch("stabilize", { loading: true, error: "" });
+    try {
+      const system = "You are the Governance and KPI agent, phase 2 (Stabilize) of a program-turnaround recovery platform. Given the approved Program Health Report from Diagnose and this period's governance and tracking data, produce, with short headers and bullets: a governance health snapshot naming stale or undecided items, a KPI dashboard summary (qualitative if no numbers are given), a blocker escalation list for anything aging past a reasonable threshold, and a vendor accountability note. Flag plainly wherever the input does not give you enough to assess something, rather than guessing. Keep the entire response under 550 words.";
+      const userText = `PROGRAM HEALTH REPORT (from Diagnose)\n\n${engagement.diagnose.reportDraft || "(not available)"}\n\nDECISION LOG ENTRIES THIS PERIOD\n${d.decisions || "(not provided)"}\n\nKPI / METRICS UPDATE\n${d.kpis || "(not provided)"}\n\nVENDOR STATUS\n${d.vendors || "(not provided)"}\n\nNEW OR AGING RAID ITEMS\n${d.raid || "(not provided)"}`;
+      const out = await callClaude(system, userText);
+      patch("stabilize", { agentOut: out, decisionsDraft: out, loading: false });
+    } catch (e) {
+      patch("stabilize", { loading: false, error: e.message || "Something went wrong." });
+    }
+  }
+
+  return (
+    <div>
+      <PhaseHeader eyebrow="Phase 2 · Days 11–45" title="Stabilize" desc="Rebuild governance and visibility, and clear blockers as they age." />
+
+      <StepCard owner="client" title="Submit this period's governance & tracking data" status={inputReady ? "done" : "active"}>
+        <TextField label="Decision log entries this period" value={d.decisions} onChange={(e) => patch("stabilize", { decisions: e.target.value })} />
+        <TextField label="KPI / metrics update" value={d.kpis} onChange={(e) => patch("stabilize", { kpis: e.target.value })} />
+        <TextField label="Vendor status" value={d.vendors} onChange={(e) => patch("stabilize", { vendors: e.target.value })} />
+        <TextField label="New or aging RAID items" value={d.raid} onChange={(e) => patch("stabilize", { raid: e.target.value })} />
+      </StepCard>
+
+      <StepCard owner="ai" title="Run: Governance & KPI agent" status={d.agentOut ? "done" : inputReady ? "active" : "pending"}>
+        <p className="text-sm text-neutral-600 mb-3">Builds the governance snapshot, KPI summary, blocker escalations, and vendor scorecard.</p>
+        {!d.agentOut && (
+          <button disabled={!inputReady || d.loading} onClick={runAgent} className="text-sm font-medium bg-teal-800 text-white px-4 py-2 rounded disabled:opacity-40 inline-flex items-center gap-2">
+            {d.loading && <Loader2 size={14} className="animate-spin" />} Run agent
+          </button>
+        )}
+        {d.error && <p className="text-sm text-red-700 mt-2">{d.error} <button onClick={runAgent} className="underline">Retry</button></p>}
+      </StepCard>
+
+      {d.agentOut && (
+        <StepCard owner="lead" title="Weekly review & decisions" status={d.approved ? "done" : "active"}>
+          <p className="text-sm text-neutral-600 mb-3">Edit into the decisions actually made this week before approving.</p>
+          <textarea className="w-full border border-neutral-300 rounded p-3 text-sm font-sans" rows={12} value={d.decisionsDraft} onChange={(e) => patch("stabilize", { decisionsDraft: e.target.value })} />
+          {!d.approved && (
+            <button onClick={() => patch("stabilize", { approved: true })} className="mt-3 text-sm font-medium bg-amber-800 text-white px-4 py-2 rounded">
+              Approve
+            </button>
+          )}
+        </StepCard>
+      )}
+
+      {d.approved && (
+        <StepCard owner="client" title="Action owner & confirm" status={d.clientAck ? "done" : "active"}>
+          {!d.clientAck ? (
+            <button onClick={() => { patch("stabilize", { clientAck: true }); setView("recover"); }} className="text-sm font-medium bg-neutral-900 text-white px-4 py-2 rounded">
+              Confirm blockers are being worked & unlock Recover phase
+            </button>
+          ) : (
+            <p className="text-sm text-teal-800">Confirmed. Recover phase is open.</p>
+          )}
+        </StepCard>
+      )}
+    </div>
+  );
+}
+
+function RecoverView({ engagement, patch, setView }) {
+  const d = engagement.recover;
+  const inputReady = !!(d.exec || d.readiness);
+
+  async function runAgent() {
+    patch("recover", { loading: true, error: "" });
+    try {
+      const system = "You are the Re-baseline and Transition agent, phase 3 (Recover) of a program-turnaround recovery platform. Given the full engagement history and current execution status, produce, with short headers: a re-baselined plan outline (revised milestones and approach at a high level) and a draft Transition Playbook (lessons learned from this engagement, plus a handoff checklist the client's own team can run without the recovery lead). Ground everything only in the history and status supplied; do not invent unrelated details. Keep the entire response under 650 words.";
+      const userText = `PROGRAM HEALTH REPORT (Diagnose)\n\n${engagement.diagnose.reportDraft || "(not available)"}\n\nSTABILIZE PHASE SUMMARY\n\n${engagement.stabilize.decisionsDraft || "(not available)"}\n\nCURRENT EXECUTION STATUS\n${d.exec || "(not provided)"}\n\nTEAM / READINESS NOTES\n${d.readiness || "(not provided)"}`;
+      const out = await callClaude(system, userText);
+      patch("recover", { agentOut: out, playbookDraft: out, loading: false });
+    } catch (e) {
+      patch("recover", { loading: false, error: e.message || "Something went wrong." });
+    }
+  }
+
+  return (
+    <div>
+      <PhaseHeader eyebrow="Phase 3 · Days 46–90" title="Recover" desc="Re-baseline against reality, execute, and hand off cleanly." />
+
+      <StepCard owner="client" title="Submit current execution status" status={inputReady ? "done" : "active"}>
+        <TextField label="Current milestone / execution status" value={d.exec} onChange={(e) => patch("recover", { exec: e.target.value })} />
+        <TextField label="Team / readiness notes" value={d.readiness} onChange={(e) => patch("recover", { readiness: e.target.value })} />
+      </StepCard>
+
+      <StepCard owner="ai" title="Run: Re-baseline & Transition agent" status={d.agentOut ? "done" : inputReady ? "active" : "pending"}>
+        <p className="text-sm text-neutral-600 mb-3">Drafts the re-baselined plan and the transition playbook from the engagement's own data trail.</p>
+        {!d.agentOut && (
+          <button disabled={!inputReady || d.loading} onClick={runAgent} className="text-sm font-medium bg-teal-800 text-white px-4 py-2 rounded disabled:opacity-40 inline-flex items-center gap-2">
+            {d.loading && <Loader2 size={14} className="animate-spin" />} Run agent
+          </button>
+        )}
+        {d.error && <p className="text-sm text-red-700 mt-2">{d.error} <button onClick={runAgent} className="underline">Retry</button></p>}
+      </StepCard>
+
+      {d.agentOut && (
+        <StepCard owner="lead" title="Final review & sign-off" status={d.approved ? "done" : "active"}>
+          <textarea className="w-full border border-neutral-300 rounded p-3 text-sm font-sans" rows={14} value={d.playbookDraft} onChange={(e) => patch("recover", { playbookDraft: e.target.value })} />
+          {!d.approved && (
+            <button onClick={() => patch("recover", { approved: true })} className="mt-3 text-sm font-medium bg-amber-800 text-white px-4 py-2 rounded">
+              Approve final transition playbook
+            </button>
+          )}
+        </StepCard>
+      )}
+
+      {d.approved && (
+        <StepCard owner="client" title="Confirm ownership transfer" status={d.clientAck ? "done" : "active"}>
+          {!d.clientAck ? (
+            <button onClick={() => patch("recover", { clientAck: true })} className="text-sm font-medium bg-neutral-900 text-white px-4 py-2 rounded">
+              Confirm & complete engagement
+            </button>
+          ) : (
+            <p className="text-sm text-teal-800">Engagement complete.</p>
+          )}
+        </StepCard>
+      )}
+    </div>
+  );
+}
+
+function CompleteView({ engagement, resetAll }) {
+  return (
+    <div>
+      <PhaseHeader eyebrow="Complete" title="Engagement summary" desc="All three phase deliverables, in one place." />
+      <StepCard owner="lead" title="Program Health Report" status="done">
+        <pre className="whitespace-pre-wrap text-sm bg-neutral-50 border border-neutral-200 rounded p-3 font-sans">{engagement.diagnose.reportDraft}</pre>
+      </StepCard>
+      <StepCard owner="lead" title="Stabilize-phase governance & KPI summary" status="done">
+        <pre className="whitespace-pre-wrap text-sm bg-neutral-50 border border-neutral-200 rounded p-3 font-sans">{engagement.stabilize.decisionsDraft}</pre>
+      </StepCard>
+      <StepCard owner="lead" title="Re-baselined plan & Transition Playbook" status="done">
+        <pre className="whitespace-pre-wrap text-sm bg-neutral-50 border border-neutral-200 rounded p-3 font-sans">{engagement.recover.playbookDraft}</pre>
+      </StepCard>
+      <button onClick={resetAll} className="text-sm font-medium bg-neutral-900 text-white px-4 py-2 rounded">Start a new request</button>
+    </div>
+  );
+}
+
+function PTaaSOperationsConsole() {
+  const [view, setView] = useState("intake");
+  const [engagement, setEngagement] = useState(initialEngagement());
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await storage.get(STORAGE_KEY);
+        if (result && result.value) {
+          setEngagement(JSON.parse(result.value));
+        }
+      } catch (e) {
+        // nothing saved yet, start fresh
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  const persist = useCallback((next) => {
+    setEngagement(next);
+    storage.set(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+  }, []);
+
+  function patch(section, fields) {
+    const next = { ...engagement, [section]: { ...engagement[section], ...fields } };
+    persist(next);
+  }
+
+  function resetAll() {
+    persist(initialEngagement());
+    setView("intake");
+  }
+
+  const phases = [
+    { key: "intake", label: "Request" },
+    { key: "diagnose", label: "Diagnose" },
+    { key: "stabilize", label: "Stabilize" },
+    { key: "recover", label: "Recover" },
+    { key: "complete", label: "Complete" },
+  ];
+  const unlockedIndex = (() => {
+    if (!engagement.intake.approved) return 0;
+    if (!engagement.diagnose.clientAck) return 1;
+    if (!engagement.stabilize.clientAck) return 2;
+    if (!engagement.recover.clientAck) return 3;
+    return 4;
+  })();
+
+  if (!loaded) {
+    return <div className="p-10 text-neutral-500 text-sm">Loading console…</div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-neutral-50 text-neutral-900">
+      <div className="bg-neutral-900 text-neutral-50">
+        <div className="max-w-4xl mx-auto px-6 py-4 flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div className="text-[11px] tracking-widest text-amber-500 font-semibold">V2V TECHNOLOGY CONSULTING</div>
+            <div className="text-sm font-medium">PTaaS Operations Console</div>
+          </div>
+          <button onClick={resetAll} className="inline-flex items-center gap-1.5 text-xs text-neutral-300 hover:text-white border border-neutral-700 rounded px-2.5 py-1.5">
+            <RotateCcw size={13} /> New request
+          </button>
+        </div>
+        <div className="max-w-4xl mx-auto px-6 pb-3 flex gap-1 flex-wrap">
+          {phases.map((p, i) => {
+            const isUnlocked = i <= unlockedIndex;
+            const isActive = view === p.key;
+            return (
+              <button
+                key={p.key}
+                disabled={!isUnlocked}
+                onClick={() => setView(p.key)}
+                className={
+                  "flex items-center gap-1.5 text-xs px-3 py-2 rounded-t border-b-2 " +
+                  (isActive ? "border-amber-500 text-white bg-neutral-800" : isUnlocked ? "border-transparent text-neutral-300 hover:text-white" : "border-transparent text-neutral-600 cursor-not-allowed")
+                }
+              >
+                {!isUnlocked && <Lock size={11} />}
+                {i + 1}. {p.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="max-w-4xl mx-auto px-6 py-8">
+        <OwnerLegend />
+        {view === "intake" && <IntakeView engagement={engagement} patch={patch} setView={setView} />}
+        {view === "diagnose" && <DiagnoseView engagement={engagement} patch={patch} setView={setView} />}
+        {view === "stabilize" && <StabilizeView engagement={engagement} patch={patch} setView={setView} />}
+        {view === "recover" && <RecoverView engagement={engagement} patch={patch} setView={setView} />}
+        {view === "complete" && <CompleteView engagement={engagement} resetAll={resetAll} />}
+        <p className="text-xs text-neutral-400 mt-8">Progress saves automatically in this browser. Each agent step calls Claude live — responses take a few seconds.</p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<PTaaSOperationsConsole />);
+</script>
+</body>
+</html>

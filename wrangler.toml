@@ -1,0 +1,10 @@
+name = "ptaas-agent-proxy"
+main = "index.js"
+compatibility_date = "2025-01-01"
+
+# Update once your GitHub Pages site is live, e.g.:
+# [vars]
+# ALLOWED_ORIGIN = "https://kirkngrant.github.io"
+#
+# ANTHROPIC_API_KEY is a secret, not a var — set it with:
+#   npx wrangler secret put ANTHROPIC_API_KEY
